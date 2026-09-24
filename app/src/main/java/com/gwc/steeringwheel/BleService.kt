@@ -7,212 +7,346 @@ import android.content.Intent
 import android.media.AudioManager
 import android.os.*
 import android.util.Log
-import java.util.*
+import java.util.UUID
 
 class BleService : Service() {
 
-    private val TAG = "BleService"
+    private val SERVICE_UUID = UUID.fromString(
+        "12345678-1234-1234-1234-1234567890ab"
+    )
 
-    private val SERVICE_UUID: UUID =
-        UUID.fromString("12345678-1234-1234-1234-1234567890ab")
+    private val CHAR_UUID = UUID.fromString(
+        "abcd1234-5678-1234-5678-abcdef123456"
+    )
 
-    private val CHAR_UUID: UUID =
-        UUID.fromString("abcd1234-5678-1234-5678-abcdef123456")
+    private val CCCD_UUID = UUID.fromString(
+        "00002902-0000-1000-8000-00805f9b34fb"
+    )
 
-    private val CCCD_UUID: UUID =
-        UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-
-    private var device: BluetoothDevice? = null
     private var gatt: BluetoothGatt? = null
 
-    private val handler: Handler = Handler(Looper.getMainLooper())
+    private var deviceAddress: String? = null
+    private var deviceName: String = "Unknown Device"
 
-    private var reconnectAttempts = 0
-    private val BASE_DELAY_MS = 1000L
+    private var reconnecting = false
+    private var connected = false
 
-    private var lastPacketTime: Long = 0
-    private val CONNECTION_TIMEOUT = 3000L
+    private val handler = Handler(Looper.getMainLooper())
 
-    private var lastPot = -1
+    /*
+     * Reconnect every 5 seconds after a disconnect.
+     */
+    private val reconnectRunnable = object : Runnable {
 
-    private var lastButton1 = false
-    private var lastButton2 = false
+        override fun run() {
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+            if (connected) {
+                reconnecting = false
+                return
+            }
 
-        startForeground(1, createNotification("Connecting..."))
+            val address = deviceAddress
 
-        val address = intent?.getStringExtra("deviceAddress")
+            if (address == null) {
+                reconnecting = false
+                return
+            }
+            sendUpdate(
+                "Reconnecting to $deviceName...",
+                ""
+            )
+
+            Log.d(
+                "BLE",
+                "Attempting reconnect to $address"
+            )
+
+            connectToDevice(address)
+
+            /*
+             * Schedule the next attempt.
+             *
+             * This keeps retrying every 5 seconds until
+             * the connection succeeds.
+             */
+            if (!connected) {
+                handler.postDelayed(
+                    this,
+                    5000L
+                )
+            }
+        }
+    }
+
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
+
+        startForeground(
+            1,
+            createNotification("Connecting...")
+        )
+
+        val address =
+            intent?.getStringExtra("deviceAddress")
+
+        val name =
+            intent?.getStringExtra("deviceName")
+
         if (address == null) {
-            Log.e(TAG, "No device address")
+            stopSelf()
             return START_NOT_STICKY
         }
 
-        val adapter = BluetoothAdapter.getDefaultAdapter()
-        device = adapter.getRemoteDevice(address)
+        deviceAddress = address
+        deviceName = name ?: "Unknown Device"
 
-        connect()
+        deviceAddress = address
+
+        /*
+         * Cancel any previous reconnect cycle.
+         */
+        handler.removeCallbacks(reconnectRunnable)
+        reconnecting = false
+
+        connectToDevice(address)
 
         return START_STICKY
     }
 
-    private fun connect() {
+    private fun connectToDevice(address: String) {
 
-        val d = device ?: return
+        /*
+         * Close the previous GATT connection before
+         * attempting another one.
+         */
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {
+        }
 
-        Log.d(TAG, "Connecting to ${d.address}")
-
-        gatt?.close()
         gatt = null
 
-        reconnectAttempts = 0
+        try {
 
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            d.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            d.connectGatt(this, false, gattCallback)
-        }
-    }
+            val adapter =
+                BluetoothAdapter.getDefaultAdapter()
 
-    private fun scheduleReconnect() {
+            val device =
+                adapter.getRemoteDevice(address)
 
-        val delay = BASE_DELAY_MS * (reconnectAttempts + 1)
-
-        handler.postDelayed({
-
-            reconnectAttempts++
-            Log.d(TAG, "Reconnect attempt $reconnectAttempts")
-
-            connect()
-
-        }, delay)
-    }
-
-    private val gattCallback: BluetoothGattCallback = object : BluetoothGattCallback() {
-
-        override fun onConnectionStateChange(
-            g: BluetoothGatt,
-            status: Int,
-            newState: Int
-        ) {
-
-            // 🔥 HANDLE 133 + OTHER ERRORS
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "GATT error $status")
-
-                g.close()
-                gatt = null
-
-                sendUpdate("Disconnected", "Error $status")
-
-                scheduleReconnect()
-                return
-            }
-
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-
-                Log.d(TAG, "BLE connected")
-
-                reconnectAttempts = 0
-                gatt = g
-
-                lastPacketTime = System.currentTimeMillis()
-
-                sendUpdate("Connected", "Discovering services")
-
-                startWatchdog()
-
-                g.discoverServices()
-
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-
-                Log.d(TAG, "BLE disconnected")
-
-                sendUpdate("Disconnected", "Device lost")
-
-                g.close()
-                gatt = null
-
-                scheduleReconnect()
-            }
-        }
-
-        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-
-            val service = g.getService(SERVICE_UUID)
-            if (service == null) {
-                Log.e(TAG, "Service not found")
-                return
-            }
-
-            val characteristic = service.getCharacteristic(CHAR_UUID)
-            if (characteristic == null) {
-                Log.e(TAG, "Characteristic not found")
-                return
-            }
-
-            g.setCharacteristicNotification(characteristic, true)
-
-            val descriptor = characteristic.getDescriptor(CCCD_UUID)
-            descriptor?.let {
-                it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                g.writeDescriptor(it)
-            }
-
-            sendUpdate("Connected", "Notifications enabled")
-        }
-
-        override fun onCharacteristicChanged(
-            g: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-
-            lastPacketTime = System.currentTimeMillis()
-
-            val data = characteristic.value ?: return
-            if (data.size < 4) return
-
-            val pot = (data[1].toInt() shl 8) or (data[0].toInt() and 0xFF)
-
-            val button1 = data[2].toInt() == 1
-            val button2 = data[3].toInt() == 1
-
-            sendUpdate(
-                "Connected",
-                "Pot: $pot   B1: $button1   B2: $button2"
+            Log.d(
+                "BLE",
+                "Connecting to $deviceName (${device.address})"
             )
 
-            handleData(pot, button1, button2)
+            sendUpdate(
+                "Connecting to $deviceName...",
+                ""
+            )
+
+            gatt = device.connectGatt(
+                this,
+                false,
+                gattCallback
+            )
+
+        } catch (e: Exception) {
+
+            Log.e(
+                "BLE",
+                "Connection failed",
+                e
+            )
         }
     }
 
-    private fun startWatchdog() {
+    private val gattCallback =
+        object : BluetoothGattCallback() {
 
-        handler.post(object : Runnable {
+            override fun onConnectionStateChange(
+                g: BluetoothGatt,
+                status: Int,
+                newState: Int
+            ) {
 
-            override fun run() {
+                if (
+                    newState ==
+                    BluetoothProfile.STATE_CONNECTED
+                ) {
 
-                val now = System.currentTimeMillis()
+                    connected = true
+                    reconnecting = false
 
-                if (now - lastPacketTime > CONNECTION_TIMEOUT) {
+                    /*
+                     * Stop the reconnect timer.
+                     */
+                    handler.removeCallbacks(
+                        reconnectRunnable
+                    )
 
-                    Log.d(TAG, "Connection timeout")
+                    sendUpdate(
+                        "Connected to $deviceName",
+                        ""
+                    )
 
-                    sendUpdate("Disconnected", "No data")
+                    Log.d(
+                        "BLE",
+                        "Connected to $deviceName (${g.device.address})"
+                    )
 
-                    gatt?.disconnect()
-                    gatt?.close()
-                    gatt = null
+                    g.discoverServices()
 
-                    scheduleReconnect()
+                } else if (
+                    newState ==
+                    BluetoothProfile.STATE_DISCONNECTED
+                ) {
+
+                    connected = false
+
+                    sendUpdate(
+                        "Disconnected from $deviceName",
+                        "Reconnecting in 5 seconds..."
+                    )
+                    Log.d(
+                        "BLE",
+                        "Disconnected"
+                    )
+
+                    /*
+                     * Clean up this GATT instance.
+                     */
+                    try {
+                        g.close()
+                    } catch (_: Exception) {
+                    }
+
+                    if (!reconnecting) {
+
+                        reconnecting = true
+
+                        /*
+                         * First reconnect attempt happens
+                         * after 5 seconds.
+                         */
+                        handler.postDelayed(
+                            reconnectRunnable,
+                            5000L
+                        )
+                    }
+                }
+            }
+
+            override fun onServicesDiscovered(
+                g: BluetoothGatt,
+                status: Int
+            ) {
+
+                if (
+                    status !=
+                    BluetoothGatt.GATT_SUCCESS
+                ) {
+
+                    sendUpdate(
+                        "Service discovery failed",
+                        ""
+                    )
 
                     return
                 }
 
-                handler.postDelayed(this, 1000)
+                val service =
+                    g.getService(SERVICE_UUID)
+
+                if (service == null) {
+
+                    sendUpdate(
+                        "BLE service not found",
+                        ""
+                    )
+
+                    return
+                }
+
+                val characteristic =
+                    service.getCharacteristic(CHAR_UUID)
+
+                if (characteristic == null) {
+
+                    sendUpdate(
+                        "BLE characteristic not found",
+                        ""
+                    )
+
+                    return
+                }
+
+                g.setCharacteristicNotification(
+                    characteristic,
+                    true
+                )
+
+                val descriptor =
+                    characteristic.getDescriptor(
+                        CCCD_UUID
+                    )
+
+                if (descriptor == null) {
+
+                    sendUpdate(
+                        "Notification descriptor not found",
+                        ""
+                    )
+
+                    return
+                }
+
+                descriptor.value =
+                    BluetoothGattDescriptor
+                        .ENABLE_NOTIFICATION_VALUE
+
+                g.writeDescriptor(descriptor)
             }
-        })
-    }
+
+            override fun onCharacteristicChanged(
+                g: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic
+            ) {
+
+                val data = characteristic.value
+
+                if (data.size < 4)
+                    return
+
+                val pot =
+                    (data[1].toInt() shl 8) or
+                            (data[0].toInt() and 0xFF)
+
+                val button1 =
+                    data[2].toInt() == 1
+
+                val button2 =
+                    data[3].toInt() == 1
+
+                sendUpdate(
+                    "Connected",
+                    "Pot: $pot  B1: $button1  B2: $button2"
+                )
+
+                handleData(
+                    pot,
+                    button1,
+                    button2
+                )
+            }
+        }
+
+    private var lastPot = -1
+    private var lastButton1 = false
+    private var lastButton2 = false
 
     private fun handleData(pot: Int, b1: Boolean, b2: Boolean) {
 
@@ -237,7 +371,6 @@ class BleService : Service() {
         lastButton1 = b1
         lastButton2 = b2
     }
-
     private fun setCallVolumeFromPot(pot: Int) {
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
@@ -255,8 +388,6 @@ class BleService : Service() {
 
         Log.d("BLE", "Pot $pot (clamped $clampedPot) → Call Volume $scaled")
     }
-
-    // 🔥 NEW PTT EVENT
     private fun sendMacroDroidPTT(pressed: Boolean) {
         val intent = Intent("com.gwc.steeringwheel.BUTTON1")
         intent.putExtra("pressed", pressed)
@@ -278,41 +409,88 @@ class BleService : Service() {
         Log.d("BLE", "MacroDroid event: $action value=$value")
     }
 
-    private fun sendUpdate(status: String, data: String) {
 
-        val intent = Intent("BLE_UPDATE")
+    private fun sendUpdate(
+        status: String,
+        data: String
+    ) {
+
+        val intent =
+            Intent("BLE_UPDATE")
+
         intent.setPackage(packageName)
 
-        intent.putExtra("status", status)
-        intent.putExtra("data", data)
+        intent.putExtra(
+            "status",
+            status
+        )
+
+        intent.putExtra(
+            "data",
+            data
+        )
 
         sendBroadcast(intent)
 
-        startForeground(1, createNotification(status))
+        startForeground(
+            1,
+            createNotification("Connecting to $deviceName...")
+        )
     }
 
-    private fun createNotification(text: String): Notification {
+    private fun createNotification(
+        text: String
+    ): Notification {
 
         val channelId = "ble_channel"
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (
+            Build.VERSION.SDK_INT >=
+            Build.VERSION_CODES.O
+        ) {
 
-            val channel = NotificationChannel(
-                channelId,
-                "BLE Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
+            val channel =
+                NotificationChannel(
+                    channelId,
+                    "BLE Service",
+                    NotificationManager.IMPORTANCE_LOW
+                )
 
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            getSystemService(
+                NotificationManager::class.java
+            ).createNotificationChannel(channel)
         }
 
-        return Notification.Builder(this, channelId)
-            .setContentTitle("Steering Wheel")
+        return Notification.Builder(
+            this,
+            channelId
+        )
+            .setContentTitle("BLE Connected")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(
+                android.R.drawable.stat_sys_data_bluetooth
+            )
             .build()
     }
 
-    override fun onBind(intent: Intent?) = null
+    override fun onDestroy() {
+
+        handler.removeCallbacksAndMessages(null)
+
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+
+        gatt = null
+        connected = false
+        reconnecting = false
+
+        super.onDestroy()
+    }
+
+    override fun onBind(
+        intent: Intent?
+    ): IBinder? = null
 }
